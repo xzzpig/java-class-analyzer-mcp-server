@@ -6,10 +6,40 @@
 
 确保你已经：
 - [ ] 在npm上注册了账号，如`https://registry.npmjs.org`
-- [ ] 登录到npm：`npm login --registry https://registry.npmjs.org`
+- [ ] 登录到npm：`npm login --registry https://registry.npmjs.org`（见下方「认证方式」）
 - [ ] 更新了package.json中的repository URL
 - [ ] 更新了README.md中的GitHub链接
 - [ ] 确认本地镜像源一致。使用`npm config get registry`查看和`npm config set registry https://registry.npmjs.org`设置
+
+#### 认证方式（推荐：用户级 `.npmrc`）
+
+发布凭证写在**用户级**配置，**不要**提交到本仓库。路径示例：
+
+- Windows：`%USERPROFILE%\.npmrc`（如 `C:\Users\<用户名>\.npmrc`）
+- macOS / Linux：`~/.npmrc`
+
+在 [npm Access Tokens](https://www.npmjs.com/settings/~tokens) 创建 **Granular Access Token**，需满足：
+
+- 对包 `java-class-analyzer-mcp-server`：**Read and write**
+- 勾选 **Bypass 2FA for publish**（或等价发布权限；npm 要求发版须 2FA 或此类 token）
+
+写入 token（将 `你的token` 替换为页面复制的值，勿提交到 git）：
+
+```bash
+npm config set //registry.npmjs.org/:_authToken "你的token" --location=user
+```
+
+或手动在用户级 `.npmrc` 增加一行：
+
+```ini
+//registry.npmjs.org/:_authToken=你的token
+```
+
+验证：
+
+```bash
+npm whoami
+```
 
 ### 2. 发布步骤
 
@@ -87,5 +117,6 @@ npm install java-class-analyzer-mcp-server
 如果发布失败：
 1. 检查包名是否已被占用
 2. 确保版本号唯一
-3. 检查npm登录状态
+3. 检查npm登录状态：`npm whoami`
 4. 验证package.json配置
+5. **`403` + `Two-factor authentication ... required to publish`**：账号未开 2FA，或 `_authToken` 为旧版/无发布权限的 token。处理：在 npm 开启 2FA 后 `npm login`，或按上文创建 Granular Token 并 `npm config set //registry.npmjs.org/:_authToken "..." --location=user` 后重试

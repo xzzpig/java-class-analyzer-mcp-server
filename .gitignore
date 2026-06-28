@@ -9,6 +9,9 @@ dist/
 build/
 *.tsbuildinfo
 
+# npm credentials (use user-level ~/.npmrc instead)
+.npmrc
+
 # Environment variables
 .env
 .env.local

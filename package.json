@@ -1,6 +1,6 @@
 {
     "name": "java-class-analyzer-mcp-server",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "MCP server for Java class file analysis and decompilation",
     "main": "dist/index.js",
     "bin": {

@@ -1,68 +1,58 @@
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
+import os from 'os';
 import { promisify } from 'util';
 import fs from 'fs-extra';
 import * as path from 'path';
-import { parseString } from 'xml2js';
+import type { Entry, ZipFile } from 'yauzl';
 import * as yauzl from 'yauzl';
+import {
+    ALLOW_REPO_FALLBACK_ENV,
+    isRepoFallbackAllowed,
+    RepoFallbackDisabledError,
+} from '../dependency/dependencyRuntimeConfig.js';
+import {
+    filterDependencySourceItems,
+    getClassIndexPath,
+    readClassIndexEntries,
+    readScanResult,
+    type ClassIndexEntry,
+    type DependencySourceFilters,
+    type DependencySourceItem,
+    type ScanResult,
+    writeClassIndexFile,
+} from './dependencySourceIndex.js';
 
-const execAsync = promisify(exec);
-const parseXmlAsync = promisify(parseString);
+const execFileAsync = promisify(execFile);
 
-export interface ClassIndexEntry {
-    className: string;
-    jarPath: string;
-    packageName: string;
-    simpleName: string;
-}
-
-export interface ScanResult {
-    jarCount: number;
-    classCount: number;
-    indexPath: string;
-    sampleEntries: string[];
-}
+export { type ClassIndexEntry, type ScanResult } from './dependencySourceIndex.js';
 
 export class DependencyScanner {
-    private indexCache: Map<string, ClassIndexEntry[]> = new Map();
-
-    /**
-     * 扫描Maven项目的所有依赖，建立类名到JAR包的映射索引
-     */
     async scanProject(projectPath: string, forceRefresh: boolean = false): Promise<ScanResult> {
-        const indexPath = path.join(projectPath, '.mcp-class-index.json');
+        const indexPath = getClassIndexPath(projectPath);
         const isDebug = process.env.NODE_ENV === 'development';
+        const indexExists = await fs.pathExists(indexPath);
 
-        // 如果强制刷新，先删除旧的索引文件
-        if (forceRefresh && await fs.pathExists(indexPath)) {
-            if (isDebug) {
-                console.error('强制刷新：删除旧的索引文件');
+        if (indexExists) {
+            if (forceRefresh) {
+                if (isDebug) {
+                    console.error('强制刷新：删除旧的索引文件');
+                }
+                await fs.remove(indexPath);
+            } else {
+                if (isDebug) {
+                    console.error('使用缓存的类索引');
+                }
+                return readScanResult(projectPath);
             }
-            await fs.remove(indexPath);
-        }
-
-        // 检查缓存
-        if (!forceRefresh && await fs.pathExists(indexPath)) {
-            if (isDebug) {
-                console.error('使用缓存的类索引');
-            }
-            const cachedIndex = await fs.readJson(indexPath);
-            return {
-                jarCount: cachedIndex.jarCount,
-                classCount: cachedIndex.classCount,
-                indexPath,
-                sampleEntries: cachedIndex.sampleEntries
-            };
         }
 
         if (isDebug) {
             console.error('开始扫描Maven依赖...');
         }
 
-        // 1. 获取Maven依赖树
         const dependencies = await this.getMavenDependencies(projectPath);
         console.error(`找到 ${dependencies.length} 个依赖JAR包`);
 
-        // 2. 解析每个JAR包，建立类索引
         const classIndex: ClassIndexEntry[] = [];
         let processedJars = 0;
 
@@ -70,80 +60,132 @@ export class DependencyScanner {
             try {
                 const classes = await this.extractClassesFromJar(jarPath);
                 classIndex.push(...classes);
-                processedJars++;
+                processedJars += 1;
 
                 if (processedJars % 10 === 0) {
                     console.error(`已处理 ${processedJars}/${dependencies.length} 个JAR包`);
                 }
             } catch (error) {
-                console.warn(`处理JAR包失败: ${jarPath}, 错误: ${error}`);
+                console.warn(`处理JAR包失败: ${jarPath}, 错误: ${error instanceof Error ? error.message : String(error)}`);
             }
         }
 
-        // 3. 保存索引到文件
         const result: ScanResult = {
             jarCount: processedJars,
             classCount: classIndex.length,
             indexPath,
-            sampleEntries: classIndex.slice(0, 10).map(entry =>
-                `${entry.className} -> ${path.basename(entry.jarPath)}`
-            )
+            sampleEntries: classIndex.slice(0, 10).map((entry) => `${entry.className} -> ${path.basename(entry.jarPath)}`),
         };
 
-        await fs.outputJson(indexPath, {
-            ...result,
-            classIndex,
-            lastUpdated: new Date().toISOString()
-        }, { spaces: 2 });
-
+        await writeClassIndexFile(projectPath, result, classIndex);
         console.error(`扫描完成！处理了 ${processedJars} 个JAR包，索引了 ${classIndex.length} 个类`);
 
         return result;
     }
 
-    /**
-     * 获取Maven依赖树中的所有JAR包路径
-     */
+    async ensureClassIndexEntries(
+        projectPath: string,
+        forceRefresh: boolean = false
+    ): Promise<readonly ClassIndexEntry[]> {
+        const indexPath = getClassIndexPath(projectPath);
+        const shouldRefresh = forceRefresh || !await fs.pathExists(indexPath);
+        if (shouldRefresh) {
+            await this.scanProject(projectPath, forceRefresh);
+        }
+        return readClassIndexEntries(projectPath);
+    }
+
+    async listClassIndexEntries(
+        projectPath: string,
+        filters: DependencySourceFilters = {}
+    ): Promise<readonly DependencySourceItem[]> {
+        const classIndex = await this.ensureClassIndexEntries(projectPath);
+        return filterDependencySourceItems(classIndex, filters);
+    }
+
+    async getClassSourceItems(
+        className: string,
+        projectPath: string,
+        filters: DependencySourceFilters = {}
+    ): Promise<readonly DependencySourceItem[]> {
+        const classIndex = await this.listClassIndexEntries(projectPath, filters);
+        return classIndex.filter((entry) => entry.className === className);
+    }
+
+    async getClassSourceItem(
+        className: string,
+        projectPath: string,
+        jarPath?: string
+    ): Promise<DependencySourceItem | null> {
+        return (await this.getClassSourceItems(className, projectPath, { jarPath }))[0] ?? null;
+    }
+
+    async findJarForClass(className: string, projectPath: string, jarPath?: string): Promise<string | null> {
+        const entry = await this.getClassSourceItem(className, projectPath, jarPath);
+        return entry?.jarPath ?? null;
+    }
+
+    async getAllClassNames(projectPath: string): Promise<string[]> {
+        const classIndex = await this.ensureClassIndexEntries(projectPath);
+        return classIndex.map((entry) => entry.className);
+    }
+
     private async getMavenDependencies(projectPath: string): Promise<string[]> {
+        const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'java-class-analyzer-maven-'));
+        const classpathFile = path.join(tempDirectory, 'classpath.txt');
+
         try {
-            // 构建Maven命令路径
             const mavenCmd = this.getMavenCommand();
-
-            // 执行 mvn dependency:tree 命令
-            const { stdout } = await execAsync(`${mavenCmd} dependency:tree -DoutputType=text`, {
-                cwd: projectPath,
-                timeout: 60000 // 60秒超时
-            });
-
-            // 解析输出，提取JAR包路径
-            const jarPaths = new Set<string>();
-            const lines = stdout.split('\n');
-
-            for (const line of lines) {
-                // 匹配类似这样的行: [INFO] +- com.example:my-lib:jar:1.0.0:compile
-                const match = line.match(/\[INFO\].*?([a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+)/);
-                if (match) {
-                    const dependency = match[1];
-                    // 构建JAR包路径
-                    const jarPath = await this.resolveJarPath(dependency, projectPath);
-                    if (jarPath && await fs.pathExists(jarPath)) {
-                        jarPaths.add(jarPath);
+            try {
+                await execFileAsync(
+                    mavenCmd,
+                    [
+                        'dependency:build-classpath',
+                        '-DincludeScope=runtime',
+                        `-Dmdep.outputFile=${classpathFile}`,
+                    ],
+                    {
+                        cwd: projectPath,
+                        shell: process.platform === 'win32',
+                        timeout: 60000,
                     }
+                );
+            } catch (error) {
+                console.error('获取Maven依赖失败:', error);
+                if (!isRepoFallbackAllowed()) {
+                    throw new RepoFallbackDisabledError(error);
+                }
+
+                console.error(`Maven依赖失败，因 ${ALLOW_REPO_FALLBACK_ENV} 已启用，回退扫描本地 Maven 仓库`);
+                return this.scanLocalMavenRepo();
+            }
+
+            const classpath = await fs.readFile(classpathFile, 'utf8');
+            const jarPaths = new Set<string>();
+            for (const classpathEntry of classpath.split(path.delimiter)) {
+                const jarPath = classpathEntry.trim();
+                if (
+                    jarPath === ''
+                    || !path.isAbsolute(jarPath)
+                    || !jarPath.endsWith('.jar')
+                    || jarPaths.has(jarPath)
+                    || !await fs.pathExists(jarPath)
+                ) {
+                    continue;
+                }
+
+                if ((await fs.stat(jarPath)).isFile()) {
+                    jarPaths.add(jarPath);
                 }
             }
 
-            return Array.from(jarPaths);
-        } catch (error) {
-            console.error('获取Maven依赖失败:', error);
-            // 如果Maven命令失败，尝试从本地仓库扫描
-            return await this.scanLocalMavenRepo(projectPath);
+            return [...jarPaths];
+        } finally {
+            await fs.remove(tempDirectory);
         }
     }
 
-    /**
-     * 从本地Maven仓库扫描JAR包
-     */
-    private async scanLocalMavenRepo(projectPath: string): Promise<string[]> {
+    private async scanLocalMavenRepo(): Promise<string[]> {
         const mavenRepoPath = this.getMavenRepositoryPath();
 
         if (!await fs.pathExists(mavenRepoPath)) {
@@ -152,15 +194,17 @@ export class DependencyScanner {
 
         const jarFiles: string[] = [];
 
-        const scanDir = async (dir: string) => {
+        const scanDir = async (dir: string): Promise<void> => {
             const entries = await fs.readdir(dir, { withFileTypes: true });
 
             for (const entry of entries) {
                 const fullPath = path.join(dir, entry.name);
-
                 if (entry.isDirectory()) {
                     await scanDir(fullPath);
-                } else if (entry.isFile() && entry.name.endsWith('.jar')) {
+                    continue;
+                }
+
+                if (entry.isFile() && entry.name.endsWith('.jar')) {
                     jarFiles.push(fullPath);
                 }
             }
@@ -170,134 +214,61 @@ export class DependencyScanner {
         return jarFiles;
     }
 
-    /**
-     * 解析依赖坐标，获取JAR包路径
-     */
-    private async resolveJarPath(dependency: string, projectPath: string): Promise<string | null> {
-        const [groupId, artifactId, type, version, scope] = dependency.split(':');
-
-        if (type !== 'jar') {
-            return null;
-        }
-
-        // 使用统一的Maven仓库路径获取方法
-        const mavenRepoPath = this.getMavenRepositoryPath();
-        const groupPath = groupId.replace(/\./g, '/');
-        const jarPath = path.join(
-            mavenRepoPath,
-            groupPath,
-            artifactId,
-            version,
-            `${artifactId}-${version}.jar`
-        );
-
-        return jarPath;
-    }
-
-    /**
-     * 从JAR包中提取所有类文件信息
-     */
     private async extractClassesFromJar(jarPath: string): Promise<ClassIndexEntry[]> {
         return new Promise((resolve, reject) => {
             const classes: ClassIndexEntry[] = [];
 
-            yauzl.open(jarPath, { lazyEntries: true }, (err: any, zipfile: any) => {
-                if (err) {
-                    reject(err);
+            yauzl.open(jarPath, { lazyEntries: true }, (openError: Error | null, zipfile?: ZipFile) => {
+                if (openError || zipfile === undefined) {
+                    reject(openError ?? new Error(`无法打开JAR包 ${jarPath}`));
                     return;
                 }
 
                 zipfile.readEntry();
 
-                zipfile.on('entry', (entry: any) => {
+                zipfile.on('entry', (entry: Entry) => {
                     if (entry.fileName.endsWith('.class') && !entry.fileName.includes('$')) {
-                        const className = entry.fileName
-                            .replace(/\.class$/, '')
-                            .replace(/\//g, '.');
-
+                        const className = entry.fileName.replace(/\.class$/u, '').replace(/\//gu, '.');
                         const lastDotIndex = className.lastIndexOf('.');
-                        const packageName = lastDotIndex > 0 ? className.substring(0, lastDotIndex) : '';
-                        const simpleName = lastDotIndex > 0 ? className.substring(lastDotIndex + 1) : className;
+                        const packageName = lastDotIndex > 0 ? className.slice(0, lastDotIndex) : '';
+                        const simpleName = lastDotIndex > 0 ? className.slice(lastDotIndex + 1) : className;
 
                         classes.push({
                             className,
                             jarPath,
                             packageName,
-                            simpleName
+                            simpleName,
                         });
                     }
 
                     zipfile.readEntry();
                 });
 
-                zipfile.on('end', () => {
-                    resolve(classes);
-                });
-
-                zipfile.on('error', (err: any) => {
-                    reject(err);
-                });
+                zipfile.on('end', () => resolve(classes));
+                zipfile.on('error', (zipError: Error) => reject(zipError));
             });
         });
     }
 
-    /**
-     * 根据类名查找对应的JAR包路径
-     */
-    async findJarForClass(className: string, projectPath: string): Promise<string | null> {
-        const indexPath = path.join(projectPath, '.mcp-class-index.json');
-
-        if (!await fs.pathExists(indexPath)) {
-            throw new Error('类索引不存在，请先运行依赖扫描');
-        }
-
-        const indexData = await fs.readJson(indexPath);
-        const classIndex: ClassIndexEntry[] = indexData.classIndex;
-
-        const entry = classIndex.find(entry => entry.className === className);
-        return entry ? entry.jarPath : null;
-    }
-
-    /**
-     * 获取所有已索引的类名
-     */
-    async getAllClassNames(projectPath: string): Promise<string[]> {
-        const indexPath = path.join(projectPath, '.mcp-class-index.json');
-
-        if (!await fs.pathExists(indexPath)) {
-            return [];
-        }
-
-        const indexData = await fs.readJson(indexPath);
-        const classIndex: ClassIndexEntry[] = indexData.classIndex;
-
-        return classIndex.map(entry => entry.className);
-    }
-
-    /**
-     * 获取Maven命令路径
-     */
     private getMavenCommand(): string {
         const mavenHome = process.env.MAVEN_HOME;
         if (mavenHome) {
             const mavenCmd = process.platform === 'win32' ? 'mvn.cmd' : 'mvn';
             return path.join(mavenHome, 'bin', mavenCmd);
         }
-        return 'mvn'; // 回退到PATH中的mvn
+        return 'mvn';
     }
 
-    /**
-     * 获取Maven本地仓库路径
-     */
     private getMavenRepositoryPath(): string {
-        // 1. 优先使用环境变量 MAVEN_REPO 指定的仓库路径
         const mavenRepo = process.env.MAVEN_REPO;
         if (mavenRepo) {
             return mavenRepo;
         }
 
-        // 2. 使用默认的Maven本地仓库路径
-        const homeDir = process.env.HOME || process.env.USERPROFILE;
-        return path.join(homeDir!, '.m2', 'repository');
+        const homeDir = process.env.HOME ?? process.env.USERPROFILE;
+        if (homeDir === undefined) {
+            throw new Error('无法确定用户目录，无法定位 Maven 本地仓库');
+        }
+        return path.join(homeDir, '.m2', 'repository');
     }
 }
